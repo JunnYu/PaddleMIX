@@ -144,11 +144,11 @@ if is_paddle_available():
     # paddle.Tensor.clamp = paddle.clip
     # paddle.clamp = paddle.clip
 
-    def view_pt(x, *shape: builtins.int, name=None):
-        return paddle.reshape(x, shape=shape, name=name)
+    # def view_pt(x, *shape: builtins.int, name=None):
+    #     return paddle.reshape(x, shape=shape, name=name)
 
-    paddle.view = view_pt
-    paddle.Tensor.view = view_pt
+    # paddle.view = view_pt
+    # paddle.Tensor.view = view_pt
 
     if not hasattr(paddle.Tensor, "data_ptr"):
         paddle.Tensor.data_ptr = lambda x: x.value().get_tensor()._ptr()
@@ -216,7 +216,8 @@ if is_paddle_available():
 
     paddle.gather_nd = gather_nd
     paddle.Tensor.gather_nd = gather_nd
-    paddle.Tensor.contiguous = lambda x: x
+    if not hasattr(paddle.Tensor, "contiguous"):
+        paddle.Tensor.contiguous = lambda x: x
 
     # must return self!
     def eval(self):
