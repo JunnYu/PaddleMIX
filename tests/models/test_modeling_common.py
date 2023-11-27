@@ -1,4 +1,5 @@
 # Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+# Copyright 2023 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,790 +12,433 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import annotations
 
-import copy
 import inspect
 import os
-import random
-import shutil
 import tempfile
 import unittest
-from typing import Optional, Tuple, Type
+import unittest.mock as mock
+from typing import Dict, List, Tuple
 
 import numpy as np
 import paddle
-from paddlenlp.transformers.configuration_utils import PretrainedConfig
-from paddlenlp.transformers.model_utils import PretrainedModel
+import requests_mock
+from requests.exceptions import HTTPError
 
-from paddlemix.models.blip2.Qformer import BertLMHeadModel
-from paddlemix.utils.env import CONFIG_NAME, LEGACY_CONFIG_NAME, MODEL_HOME
-from tests.testing_utils import slow
-
-
-def _config_zero_init(config):
-    configs_no_init = copy.deepcopy(config)
-    for key in configs_no_init.__dict__.keys():
-        if "_range" in key or "_std" in key or "initializer_factor" in key or "layer_scale" in key:
-            setattr(configs_no_init, key, 1e-10)
-    return configs_no_init
+from ppdiffusers.models import UNet2DConditionModel
+from ppdiffusers.models.attention_processor import (
+    AttnProcessor,
+    AttnProcessor2_5,
+    XFormersAttnProcessor,
+)
+from ppdiffusers.training_utils import EMAModel
+from ppdiffusers.utils import logging
+from ppdiffusers.utils.testing_utils import CaptureLogger, nightly, require_paddle_gpu
 
 
-def get_gpus(selected_gpus):
-    selected_gpus = [x.strip() for x in selected_gpus.split(",")]
-    return selected_gpus
+class ModelUtilsTest(unittest.TestCase):
+    def tearDown(self):
+        super().tearDown()
+
+        import ppdiffusers
+
+        ppdiffusers.utils.import_utils._safetensors_available = True
+
+    def test_cached_files_are_used_when_no_internet(self):
+        response_mock = mock.Mock()
+        response_mock.status_code = 500
+        response_mock.headers = {}
+        response_mock.raise_for_status.side_effect = HTTPError
+        response_mock.json.return_value = {}
+        orig_model = UNet2DConditionModel.from_pretrained(
+            "hf-internal-testing/tiny-stable-diffusion-torch", subfolder="unet"
+        )
+        with mock.patch("requests.request", return_value=response_mock):
+            model = UNet2DConditionModel.from_pretrained(
+                "hf-internal-testing/tiny-stable-diffusion-torch", subfolder="unet", local_files_only=True
+            )
+        for p1, p2 in zip(orig_model.parameters(), model.parameters()):
+            if (p1 != p2).cast("int64").sum() > 0:
+                assert False, "Parameters not the same!"
+
+    @nightly
+    def test_one_request_upon_cached(self):
+        import ppdiffusers
+
+        ppdiffusers.utils.import_utils._safetensors_available = False
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            with requests_mock.mock(real_http=True) as m:
+                UNet2DConditionModel.from_pretrained(
+                    "hf-internal-testing/tiny-stable-diffusion-torch",
+                    subfolder="unet",
+                    cache_dir=tmpdirname,
+                    from_hf_hub=True,
+                    from_diffusers=True,
+                )
+
+            download_requests = [r.method for r in m.request_history]
+            assert download_requests.count("HEAD") == 2, "2 HEAD requests one for config, one for model"
+            assert download_requests.count("GET") == 2, "2 GET requests one for config, one for model"
+
+            with requests_mock.mock(real_http=True) as m:
+                UNet2DConditionModel.from_pretrained(
+                    "hf-internal-testing/tiny-stable-diffusion-torch",
+                    subfolder="unet",
+                    cache_dir=tmpdirname,
+                    from_hf_hub=True,
+                    from_diffusers=True,
+                )
+
+            cache_requests = [r.method for r in m.request_history]
+            # TODO check this
+            assert (
+                "HEAD" == cache_requests[0] and len(cache_requests) == 2
+            ), "We should call only `model_info` to check for _commit hash and `send_telemetry`"
+
+        ppdiffusers.utils.import_utils._safetensors_available = True
+
+    def test_weight_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmpdirname, self.assertRaises(RuntimeError) as error_context:
+            UNet2DConditionModel.from_pretrained(
+                "hf-internal-testing/tiny-stable-diffusion-torch",
+                subfolder="unet",
+                cache_dir=tmpdirname,
+                in_channels=9,
+                # from_hf_hub=True,
+                # from_diffusers=True,
+            )
+
+        # make sure that error message states what keys are missing
+        assert "size mismatch" in str(error_context.exception)
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model = UNet2DConditionModel.from_pretrained(
+                "hf-internal-testing/tiny-stable-diffusion-torch",
+                subfolder="unet",
+                cache_dir=tmpdirname,
+                in_channels=9,
+                low_cpu_mem_usage=False,
+                ignore_mismatched_sizes=True,
+                # from_hf_hub=True,
+                # from_diffusers=True,
+            )
+
+        assert model.config.in_channels == 9
 
 
-def ids_tensor(shape, vocab_size, dtype="int32"):
-    #  Creates a random int32 tensor of the shape within the vocab size
-    return paddle.randint(low=1, high=vocab_size, dtype=dtype, shape=shape)
+class UNetTesterMixin:
+    def test_forward_signature(self):
+        init_dict, _ = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        signature = inspect.signature(model.forward)
+        arg_names = [*signature.parameters.keys()]
+        expected_arg_names = ["sample", "timestep"]
+        self.assertListEqual(arg_names[:2], expected_arg_names)
 
-
-def random_attention_mask(shape, dtype="int32"):
-    attn_mask = ids_tensor(shape, vocab_size=2, dtype=dtype)
-    # make sure that at least one token is attended to for each batch
-    attn_mask[:, -1] = 1
-    return attn_mask
-
-
-def floats_tensor(shape, scale=1.0):
-    """Creates a random float32 tensor"""
-    return scale * paddle.randn(shape, dtype="float32")
-
-
-def check_two_model_parameter(first_model: PretrainedModel, second_model: PretrainedModel):
-    assert len(set(first_model.state_dict().keys()) - set(second_model.state_dict().keys())) == 0
-
-    # random choice the keys to compare
-    key = random.choice(list(first_model.state_dict().keys()))
-    diff = first_model.state_dict()[key] - second_model.state_dict()[key]
-    assert diff.sum().item() == 0
+    def test_forward_with_norm_groups(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        init_dict["norm_num_groups"] = 16
+        init_dict["block_out_channels"] = 16, 32
+        model = self.model_class(**init_dict)
+        model.eval()
+        with paddle.no_grad():
+            output = model(**inputs_dict)
+            if isinstance(output, dict):
+                output = output.to_tuple()[0]
+        self.assertIsNotNone(output)
+        expected_shape = inputs_dict["sample"].shape
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
 
 
 class ModelTesterMixin:
-    model_tester = None
-    base_model_class: Optional[Type[PretrainedModel]] = None
-    all_model_classes: Tuple[Type[PretrainedModel]] = ()
-    all_generative_model_classes = ()
-    test_resize_embeddings = True
-    test_resize_position_embeddings = False
-    test_mismatched_shapes = True
-    test_missing_keys = True
-    test_model_compatibility_keys = True
-    test_tie_weights = False
-    use_test_inputs_embeds = False
-    use_test_model_name_list = True
-    is_encoder_decoder = False
-    has_attentions = True
-    model_split_percents = [0.5, 0.7, 0.9]
+    main_input_name = None  # overwrite in model specific tester class
+    base_precision = 1e-3
 
-    def _prepare_for_class(self, inputs_dict, model_class):
-        inputs_dict = copy.deepcopy(inputs_dict)
-        return inputs_dict
+    def test_from_save_pretrained(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        if hasattr(model, "set_default_attn_processor"):
+            model.set_default_attn_processor()
+        model.eval()
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname)
+            new_model = self.model_class.from_pretrained(tmpdirname)
+            if hasattr(new_model, "set_default_attn_processor"):
+                new_model.set_default_attn_processor()
+        with paddle.no_grad():
+            image = model(**inputs_dict)
+            if isinstance(image, dict):
+                image = image.to_tuple()[0]
+            new_image = new_model(**inputs_dict)
+            if isinstance(new_image, dict):
+                new_image = new_image.to_tuple()[0]
+        max_diff = (image - new_image).abs().sum().item()
+        self.assertLessEqual(max_diff, 1e-01, "Models give different forward passes")
 
-    def _make_model_instance(self, config, model_class):
-        if isinstance(config, PretrainedConfig):
-            return model_class(config)
-        if model_class == self.base_model_class:
-            return model_class(**config)
+    def test_getattr_is_correct(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
 
-        return model_class(self.base_model_class(**config))
+        # save some things to test
+        model.dummy_attribute = 5
+        model.register_to_config(test_attribute=5)
 
-    def test_save_load(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        logger = logging.get_logger("ppdiffusers.models.modeling_utils")
+        # 30 for warning
+        logger.setLevel(30)
+        with CaptureLogger(logger) as cap_logger:
+            assert hasattr(model, "dummy_attribute")
+            assert getattr(model, "dummy_attribute") == 5
+            assert model.dummy_attribute == 5
 
-        def check_save_load(out1, out2):
-            # make sure we don't have nans
-            out_2 = out2.numpy()
-            out_2[np.isnan(out_2)] = 0
+        # no warning should be thrown
+        assert cap_logger.out == ""
 
-            out_1 = out1.numpy()
-            out_1[np.isnan(out_1)] = 0
-            max_diff = np.amax(np.abs(out_1 - out_2))
-            self.assertLessEqual(max_diff, 1e-5)
+        logger = logging.get_logger("ppdiffusers.models.modeling_utils")
+        # 30 for warning
+        logger.setLevel(30)
+        with CaptureLogger(logger) as cap_logger:
+            assert hasattr(model, "save_pretrained")
+            fn = model.save_pretrained
+            fn_1 = getattr(model, "save_pretrained")
 
-        for model_class in self.all_model_classes:
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-            with paddle.no_grad():
-                first = model(**self._prepare_for_class(inputs_dict, model_class))[0]
+            assert fn == fn_1
+        # no warning should be thrown
+        assert cap_logger.out == ""
+
+        # warning should be thrown
+        with self.assertWarns(FutureWarning):
+            assert model.test_attribute == 5
+
+        with self.assertWarns(FutureWarning):
+            assert getattr(model, "test_attribute") == 5
+
+        with self.assertRaises(AttributeError) as error:
+            model.does_not_exist
+
+        assert str(error.exception) == f"'{type(model).__name__}' object has no attribute 'does_not_exist'"
+
+    @require_paddle_gpu
+    def test_set_attn_processor_for_determinism(self):
+        os.environ["FLAGS_cudnn_deterministic"] = "False"
+        os.environ["FLAGS_cpu_deterministic"] = "False"
+
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        if not hasattr(model, "set_attn_processor"):
+            return
+        assert all(type(proc) == AttnProcessor2_5 for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_1 = model(**inputs_dict)[0]
+        model.set_default_attn_processor()
+        assert all(type(proc) == AttnProcessor for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_2 = model(**inputs_dict)[0]
+        model.enable_xformers_memory_efficient_attention()
+        assert all(type(proc) == XFormersAttnProcessor for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_3 = model(**inputs_dict)[0]
+        model.set_attn_processor(AttnProcessor2_5())
+        assert all(type(proc) == AttnProcessor2_5 for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_4 = model(**inputs_dict)[0]
+        model.set_attn_processor(AttnProcessor())
+        assert all(type(proc) == AttnProcessor for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_5 = model(**inputs_dict)[0]
+        model.set_attn_processor(XFormersAttnProcessor())
+        assert all(type(proc) == XFormersAttnProcessor for proc in model.attn_processors.values())
+        with paddle.no_grad():
+            output_6 = model(**inputs_dict)[0]
+        os.environ["FLAGS_cudnn_deterministic"] = "True"
+        os.environ["FLAGS_cpu_deterministic"] = "True"
+        assert paddle.allclose(x=output_2, y=output_1, atol=self.base_precision).item()
+        assert paddle.allclose(x=output_2, y=output_3, atol=self.base_precision).item()
+        assert paddle.allclose(x=output_2, y=output_4, atol=self.base_precision).item()
+        assert paddle.allclose(x=output_2, y=output_5, atol=self.base_precision).item()
+        assert paddle.allclose(x=output_2, y=output_6, atol=self.base_precision).item()
+
+    def test_from_save_pretrained_variant(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        if hasattr(model, "set_default_attn_processor"):
+            model.set_default_attn_processor()
+        model.eval()
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname, variant="fp16")
+            new_model = self.model_class.from_pretrained(tmpdirname, variant="fp16")
+            if hasattr(new_model, "set_default_attn_processor"):
+                new_model.set_default_attn_processor()
+            # non-variant cannot be loaded
+            with self.assertRaises(OSError) as error_context:
+                self.model_class.from_pretrained(tmpdirname)
+
+            # make sure that error message states what keys are missing
+            # support diffusion_pytorch_model.bin and model_state.pdparams
+            assert "Error no file named model_state.pdparams found in directory" in str(
+                error_context.exception
+            ) or "Error no file named diffusion_pytorch_model.bin found in directory" in str(error_context.exception)
+        with paddle.no_grad():
+
+            image = model(**inputs_dict)
+            if isinstance(image, dict):
+                image = image.to_tuple()[0]
+
+            new_image = new_model(**inputs_dict)
+            if isinstance(new_image, dict):
+                new_image = new_image.to_tuple()[0]
+        max_diff = (image - new_image).abs().sum().item()
+        self.assertLessEqual(max_diff, 1e-01, "Models give different forward passes")
+
+    def test_from_save_pretrained_dtype(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.eval()
+        for dtype in [paddle.float32, paddle.float16, paddle.bfloat16]:
 
             with tempfile.TemporaryDirectory() as tmpdirname:
+                model.to(dtype=dtype)
                 model.save_pretrained(tmpdirname)
-                model = model_class.from_pretrained(tmpdirname)
-                model.eval()
-                with paddle.no_grad():
-                    second = model(**self._prepare_for_class(inputs_dict, model_class))[0]
+                new_model = self.model_class.from_pretrained(tmpdirname, paddle_dtype=dtype)
+                assert new_model.dtype == dtype
+                new_model = self.model_class.from_pretrained(tmpdirname, paddle_dtype=dtype)
+                assert new_model.dtype == dtype
 
-            # support tuple of tensor
-            if isinstance(first, tuple) and isinstance(second, tuple):
-                for tensor1, tensor2 in zip(first, second):
-                    check_save_load(tensor1, tensor2)
-            else:
-                check_save_load(first, second)
+    def test_determinism(self, expected_max_diff=1e-4):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.eval()
+        with paddle.no_grad():
+            first = model(**inputs_dict)
+            if isinstance(first, dict):
+                first = first.to_tuple()[0]
+            second = model(**inputs_dict)
+            if isinstance(second, dict):
+                second = second.to_tuple()[0]
+        out_1 = first.cpu().numpy()
+        out_2 = second.cpu().numpy()
+        out_1 = out_1[~np.isnan(out_1)]
+        out_2 = out_2[~np.isnan(out_2)]
+        max_diff = np.amax(np.abs(out_1 - out_2))
+        self.assertLessEqual(max_diff, expected_max_diff)
 
-    def test_determinism(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+    def test_output(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.eval()
+        with paddle.no_grad():
+            output = model(**inputs_dict)
+            if isinstance(output, dict):
+                output = output.to_tuple()[0]
+        self.assertIsNotNone(output)
+        # input & output have to have the same shape
+        input_tensor = inputs_dict[self.main_input_name]
+        expected_shape = input_tensor.shape
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
 
-        def check_determinism(first, second):
-            out_1 = first.numpy()
-            out_2 = second.numpy()
-            out_1 = out_1[~np.isnan(out_1)]
-            out_2 = out_2[~np.isnan(out_2)]
-            max_diff = np.amax(np.abs(out_1 - out_2))
-            self.assertLessEqual(max_diff, 1e-5)
+    def test_model_from_pretrained(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.eval()
 
-        for model_class in self.all_model_classes:
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-            with paddle.no_grad():
-                first = model(**self._prepare_for_class(inputs_dict, model_class))[0]
-                second = model(**self._prepare_for_class(inputs_dict, model_class))[0]
+        # test if the model can be loaded from the config
+        # and has all the expected shape
+        with tempfile.TemporaryDirectory() as tmpdirname:
 
-            if isinstance(first, tuple) and isinstance(second, tuple):
-                for tensor1, tensor2 in zip(first, second):
-                    check_determinism(tensor1, tensor2)
-            else:
-                check_determinism(first, second)
+            model.save_pretrained(tmpdirname)
+            print("##############")
+            print(os.listdir(tmpdirname))
+            new_model = self.model_class.from_pretrained(tmpdirname)
+            new_model.eval()
+        for param_name in model.state_dict().keys():
+            param_1 = model.state_dict()[param_name]
+            param_2 = new_model.state_dict()[param_name]
+            self.assertEqual(param_1.shape, param_2.shape)
+        with paddle.no_grad():
+            output_1 = model(**inputs_dict)
+            if isinstance(output_1, dict):
+                output_1 = output_1.to_tuple()[0]
+            output_2 = new_model(**inputs_dict)
+            if isinstance(output_2, dict):
+                output_2 = output_2.to_tuple()[0]
+        self.assertEqual(output_1.shape, output_2.shape)
 
-    def test_forward_signature(self):
-        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
-
-        for model_class in self.all_model_classes:
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            signature = inspect.signature(model.forward)
-            # signature.parameters is an OrderedDict => so arg_names order is deterministic
-            arg_names = [*signature.parameters.keys()]
-            expected_arg_names = ["input_ids"]
-            self.assertListEqual(arg_names[:1], expected_arg_names)
-
-    @unittest.skip("Not implemented yet")
     def test_training(self):
-        pass
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.train()
+        output = model(**inputs_dict)
+        if isinstance(output, dict):
+            output = output.to_tuple()[0]
+        input_tensor = inputs_dict[self.main_input_name]
+        noise = paddle.randn(shape=(input_tensor.shape[0],) + self.output_shape)
+        loss = paddle.nn.functional.mse_loss(input=output, label=noise)
+        loss.backward()
 
-    @unittest.skip("Not implemented yet")
-    def test_training_gradient_checkpointing(self):
-        pass
+    def test_ema_training(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.train()
+        ema_model = EMAModel(model.parameters())
+        output = model(**inputs_dict)
+        if isinstance(output, dict):
+            output = output.to_tuple()[0]
+        input_tensor = inputs_dict[self.main_input_name]
+        noise = paddle.randn(shape=(input_tensor.shape[0],) + self.output_shape)
+        loss = paddle.nn.functional.mse_loss(input=output, label=noise)
+        loss.backward()
+        ema_model.step(model.parameters())
 
-    def test_attention_outputs(self):
-        if not self.has_attentions:
-            return
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        seq_len = getattr(self.model_tester, "seq_length", None)
-        decoder_seq_length = getattr(self.model_tester, "decoder_seq_length", seq_len)
-        encoder_seq_length = getattr(self.model_tester, "encoder_seq_length", seq_len)
-        decoder_key_length = getattr(self.model_tester, "decoder_key_length", decoder_seq_length)
-        encoder_key_length = getattr(self.model_tester, "key_length", encoder_seq_length)
-        chunk_length = getattr(self.model_tester, "chunk_length", None)
-        if chunk_length is not None and hasattr(self.model_tester, "num_hashes"):
-            encoder_seq_length = encoder_seq_length * self.model_tester.num_hashes
+    def test_outputs_equivalence(self):
+        def set_nan_tensor_to_zero(t):
+            # t[t != t] = 0
+            return t
 
-        for model_class in self.all_model_classes:
-            signature = inspect.signature(model_class.forward)
-            # signature.parameters is an OrderedDict => so arg_names order is deterministic
-            arg_names = [*signature.parameters.keys()]
-            if not all(name in arg_names for name in ["output_attentions", "output_hidden_states", "return_dict"]):
-                continue
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = False
-            inputs_dict["return_dict"] = True
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-            with paddle.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-            attentions = outputs.encoder_attentions if self.is_encoder_decoder else outputs.attentions
-            self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
-
-            # TODO(guosheng): check that output_attentions also work using config
-
-            if chunk_length is not None:
-                self.assertListEqual(
-                    list(attentions[0].shape[-4:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        encoder_seq_length,
-                        chunk_length,
-                        encoder_key_length,
-                    ],
-                )
+        def recursive_check(tuple_object, dict_object):
+            if isinstance(tuple_object, (List, Tuple)):
+                for tuple_iterable_value, dict_iterable_value in zip(tuple_object, dict_object.values()):
+                    recursive_check(tuple_iterable_value, dict_iterable_value)
+            elif isinstance(tuple_object, Dict):
+                for tuple_iterable_value, dict_iterable_value in zip(tuple_object.values(), dict_object.values()):
+                    recursive_check(tuple_iterable_value, dict_iterable_value)
+            elif tuple_object is None:
+                return
             else:
-                self.assertListEqual(
-                    list(attentions[0].shape[-3:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        encoder_seq_length,
-                        encoder_key_length,
-                    ],
-                )
-            out_len = len(outputs)
-
-            if self.is_encoder_decoder:
-                correct_outlen = 5
-
-                # loss is at first position
-                if "labels" in inputs_dict:
-                    correct_outlen += 1  # loss is added to beginning
-                # Question Answering model returns start_logits and end_logits
-                if model_class.__name__.endswith("ForQuestionAnswering"):
-                    correct_outlen += 1  # start_logits and end_logits instead of only 1 output
-                if "past_key_values" in outputs:
-                    correct_outlen += 1  # past_key_values have been returned
-
-                self.assertEqual(out_len, correct_outlen)
-
-                # decoder attentions
-                decoder_attentions = outputs.decoder_attentions
-                self.assertIsInstance(decoder_attentions, (list, tuple))
-                self.assertEqual(len(decoder_attentions), self.model_tester.num_hidden_layers)
-                self.assertListEqual(
-                    list(decoder_attentions[0].shape[-3:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        decoder_seq_length,
-                        decoder_key_length,
-                    ],
-                )
-
-                # cross attentions
-                cross_attentions = outputs.cross_attentions
-                self.assertIsInstance(cross_attentions, (list, tuple))
-                self.assertEqual(len(cross_attentions), self.model_tester.num_hidden_layers)
-                self.assertListEqual(
-                    list(cross_attentions[0].shape[-3:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        decoder_seq_length,
-                        encoder_key_length,
-                    ],
-                )
-
-            # Check attention is always last and order is fine
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = True
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-            with paddle.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-
-            if hasattr(self.model_tester, "num_hidden_states_types"):
-                added_hidden_states = self.model_tester.num_hidden_states_types
-            elif self.is_encoder_decoder:
-                added_hidden_states = 2
-            else:
-                added_hidden_states = 1
-            self.assertEqual(out_len + added_hidden_states, len(outputs))
-
-            self_attentions = outputs.encoder_attentions if self.is_encoder_decoder else outputs.attentions
-
-            self.assertEqual(len(self_attentions), self.model_tester.num_hidden_layers)
-            if chunk_length is not None:
-                self.assertListEqual(
-                    list(self_attentions[0].shape[-4:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        encoder_seq_length,
-                        chunk_length,
-                        encoder_key_length,
-                    ],
-                )
-            else:
-                self.assertListEqual(
-                    list(self_attentions[0].shape[-3:]),
-                    [
-                        self.model_tester.num_attention_heads,
-                        encoder_seq_length,
-                        encoder_key_length,
-                    ],
-                )
-
-    def test_hidden_states_output(self):
-        def check_hidden_states_output(inputs_dict, config, model_class):
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-
-            with paddle.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-
-            hidden_states = outputs.encoder_hidden_states if self.is_encoder_decoder else outputs.hidden_states
-
-            expected_num_layers = getattr(
-                self.model_tester,
-                "expected_num_hidden_layers",
-                self.model_tester.num_hidden_layers + 1,
-            )
-            self.assertEqual(len(hidden_states), expected_num_layers)
-
-            if hasattr(self.model_tester, "encoder_seq_length"):
-                seq_length = self.model_tester.encoder_seq_length
-                if hasattr(self.model_tester, "chunk_length") and self.model_tester.chunk_length > 1:
-                    seq_length = seq_length * self.model_tester.chunk_length
-            else:
-                seq_length = self.model_tester.seq_length
-
-            self.assertListEqual(
-                list(hidden_states[0].shape[-2:]),
-                [seq_length, self.model_tester.hidden_size],
-            )
-
-            if self.is_encoder_decoder:
-                hidden_states = outputs.decoder_hidden_states
-
-                self.assertIsInstance(hidden_states, (list, tuple))
-                self.assertEqual(len(hidden_states), expected_num_layers)
-                seq_len = getattr(self.model_tester, "seq_length", None)
-                decoder_seq_length = getattr(self.model_tester, "decoder_seq_length", seq_len)
-
-                self.assertListEqual(
-                    list(hidden_states[0].shape[-2:]),
-                    [decoder_seq_length, self.model_tester.hidden_size],
-                )
-
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        inputs_dict["return_dict"] = True
-        for model_class in self.all_model_classes:
-            signature = inspect.signature(model_class.forward)
-            # signature.parameters is an OrderedDict => so arg_names order is deterministic
-            arg_names = [*signature.parameters.keys()]
-            if not all(name in arg_names for name in ["output_attentions", "output_hidden_states", "return_dict"]):
-                continue
-            inputs_dict["output_hidden_states"] = True
-            check_hidden_states_output(inputs_dict, config, model_class)
-            # TODO(guosheng): check that output_hidden_states also work using config
-
-    @unittest.skip("Not implemented")
-    def test_retain_grad_hidden_states_attentions(self):
-        pass
-
-    def test_resize_position_vector_embeddings(self):
-        if not self.test_resize_position_embeddings:
-            return
-
-        (
-            original_config,
-            inputs_dict,
-        ) = self.model_tester.prepare_config_and_inputs_for_common()
-
-        for model_class in self.all_model_classes:
-            config = copy.deepcopy(original_config)
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            if self.model_tester.is_training is False:
-                model.eval()
-
-            max_position_embeddings = config.max_position_embeddings
-
-            # Retrieve the embeddings and clone theme
-            if self.is_encoder_decoder:
-                (
-                    encoder_model_embed,
-                    decoder_model_embed,
-                ) = model.get_position_embeddings()
-                encoder_cloned_embeddings = encoder_model_embed.weight.clone()
-                decoder_cloned_embeddings = decoder_model_embed.weight.clone()
-            else:
-                model_embed = model.get_position_embeddings()
-                cloned_embeddings = model_embed.weight.clone()
-
-            # Check that resizing the position embeddings with a larger max_position_embeddings increases
-            # the model's postion embeddings size
-            model.resize_position_embeddings(max_position_embeddings + 10)
-            self.assertEqual(model.config.max_position_embeddings, max_position_embeddings + 10)
-
-            # Check that it actually resizes the embeddings matrix
-            if model.config.is_encoder_decoder:
-                (
-                    encoder_model_embed,
-                    decoder_model_embed,
-                ) = model.get_position_embeddings()
-                self.assertEqual(
-                    encoder_model_embed.weight.shape[0],
-                    encoder_cloned_embeddings.shape[0] + 10,
-                )
-                self.assertEqual(
-                    decoder_model_embed.weight.shape[0],
-                    decoder_cloned_embeddings.shape[0] + 10,
-                )
-            else:
-                model_embed = model.get_position_embeddings()
-                self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] + 10)
-
-            # Check that the model can still do a forward pass successfully (every parameter should be resized)
-            model(**self._prepare_for_class(inputs_dict, model_class))
-
-            # Check that resizing the position embeddings with a smaller max_position_embeddings decreases
-            # the model's max_position_embeddings
-            model.resize_position_embeddings(max_position_embeddings - 5)
-            self.assertEqual(
-                model.base_model.config["max_position_embeddings"],
-                max_position_embeddings - 5,
-            )
-
-            # Check that it actually resizes the embeddings matrix
-            if self.is_encoder_decoder:
-                (
-                    encoder_model_embed,
-                    decoder_model_embed,
-                ) = model.get_position_embeddings()
-                self.assertEqual(
-                    encoder_model_embed.weight.shape[0],
-                    encoder_cloned_embeddings.shape[0] - 5,
-                )
-                self.assertEqual(
-                    decoder_model_embed.weight.shape[0],
-                    decoder_cloned_embeddings.shape[0] - 5,
-                )
-            else:
-                model_embed = model.get_position_embeddings()
-                self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] - 5)
-
-            # Check that the model can still do a forward pass successfully (every parameter should be resized)
-            model(**self._prepare_for_class(inputs_dict, model_class))
-
-            # Check that adding and removing tokens has not modified the first part of the embedding matrix.
-            models_equal = True
-
-            if model.config.is_encoder_decoder:
-                for p1, p2 in zip(encoder_cloned_embeddings, encoder_model_embed.weight):
-                    if p1.data.ne(p2.data).sum() > 0:
-                        models_equal = False
-                for p1, p2 in zip(decoder_cloned_embeddings, decoder_model_embed.weight):
-                    if p1.data.ne(p2.data).sum() > 0:
-                        models_equal = False
-            else:
-                for p1, p2 in zip(cloned_embeddings, model_embed.weight):
-                    if p1.data.ne(p2.data).sum() > 0:
-                        models_equal = False
-
-            self.assertTrue(models_equal)
-
-    def test_resize_tokens_embeddings(self):
-        (
-            original_config,
-            inputs_dict,
-        ) = self.model_tester.prepare_config_and_inputs_for_common()
-        if not self.test_resize_embeddings:
-            return
-
-        for model_class in self.all_model_classes:
-            config = copy.deepcopy(original_config)
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            if self.model_tester.is_training is False:
-                model.eval()
-
-            model_vocab_size = config.vocab_size
-            # Retrieve the embeddings and clone theme
-            model_embed = model.resize_token_embeddings(model_vocab_size)
-            cloned_embeddings = model_embed.weight.clone()
-
-            # Check that resizing the token embeddings with a larger vocab size increases the model's vocab size
-            model_embed = model.resize_token_embeddings(model_vocab_size + 10)
-            self.assertEqual(model.base_model.config.vocab_size, model_vocab_size + 10)
-            # Check that it actually resizes the embeddings matrix
-            self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] + 10)
-            # Check that the model can still do a forward pass successfully (every parameter should be resized)
-            model(**self._prepare_for_class(inputs_dict, model_class))
-
-            # Check that resizing the token embeddings with a smaller vocab size decreases the model's vocab size
-            model_embed = model.resize_token_embeddings(model_vocab_size - 15)
-            self.assertEqual(model.base_model.config.vocab_size, model_vocab_size - 15)
-            # Check that it actually resizes the embeddings matrix
-            self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] - 15)
-
-            # Check that the model can still do a forward pass successfully (every parameter should be resized)
-            # Input ids should be clamped to the maximum size of the vocabulary
-            inputs_dict["input_ids"] = paddle.clip(inputs_dict["input_ids"], max=model_vocab_size - 15 - 1)
-
-            # make sure that decoder_input_ids are resized as well
-            if "decoder_input_ids" in inputs_dict:
-                inputs_dict["decoder_input_ids"] = paddle.clip(
-                    inputs_dict["decoder_input_ids"], max=model_vocab_size - 15 - 1
-                )
-            model(**self._prepare_for_class(inputs_dict, model_class))
-
-            # Check that adding and removing tokens has not modified the first part of the embedding matrix.
-            models_equal = True
-            for p1, p2 in zip(cloned_embeddings, model_embed.weight):
-                if not paddle.equal_all(p1, p2).item():
-                    models_equal = False
-                    break
-
-            self.assertTrue(models_equal)
-
-    def _compare_tensor(self, tensor1, tensor2, rtol=1e-04, atol=1e-04):
-        if tensor1.dtype != tensor2.dtype:
-            return False
-
-        if tensor1.dtype in [paddle.float32, paddle.float64]:
-            return paddle.allclose(tensor1, tensor2, rtol=rtol, atol=atol)
-        else:
-            return paddle.equal_all(tensor1, tensor2)
-
-    def test_inputs_embeds(self):
-        # pass the test if don't need to test inputs embeddings
-        if not self.use_test_inputs_embeds:
-            return
-        # get config for model and inputs_dict for model forward
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        # test all model classes
-        for model_class in self.all_model_classes:
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            model.eval()
-
-            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))
-
-            with paddle.no_grad():
-                ids_output = model(**inputs)
-
-            if not self.is_encoder_decoder:
-                input_ids = inputs["input_ids"]
-                del inputs["input_ids"]
-            else:
-                encoder_input_ids = inputs["input_ids"]
-                decoder_input_ids = inputs.get("decoder_input_ids", encoder_input_ids)
-                del inputs["input_ids"]
-                inputs.pop("decoder_input_ids", None)
-
-            wte = model.get_input_embeddings()
-            if not self.is_encoder_decoder:
-                inputs["inputs_embeds"] = wte(input_ids)
-            else:
-                inputs["inputs_embeds"] = wte(encoder_input_ids)
-                inputs["decoder_inputs_embeds"] = wte(decoder_input_ids)
-
-            with paddle.no_grad():
-                embeds_output = model(**inputs)
-
-            if isinstance(embeds_output, paddle.Tensor):
-                self.assertTrue(self._compare_tensor(ids_output, embeds_output))
-            else:
-                for ids_item, embeds_item in zip(ids_output, embeds_output):
-                    self.assertTrue(self._compare_tensor(ids_item, embeds_item))
-
-    def test_model_name_list(self):
-        if not self.use_test_model_name_list:
-            return
-        config = self.model_tester.get_config()
-        if isinstance(config, PretrainedConfig):
-            model = self.base_model_class(config)
-        else:
-            model = self.base_model_class(**config)
-        self.assertTrue(len(model.model_name_list) != 0)
-
-    def test_pretrained_config_save_load(self):
-        if self.base_model_class is None or not self.base_model_class.constructed_from_pretrained_config():
-            return
-
-        config_class = self.base_model_class.config_class
-        with tempfile.TemporaryDirectory() as tempdir:
-            config = config_class()
-
-            config.save_pretrained(tempdir)
-
-            # check the file exist
-            self.assertFalse(os.path.exists(os.path.join(tempdir, LEGACY_CONFIG_NAME)))
-            self.assertTrue(os.path.exists(os.path.join(tempdir, CONFIG_NAME)))
-
-            # rename the CONFIG_NAME
-            shutil.move(
-                os.path.join(tempdir, CONFIG_NAME),
-                os.path.join(tempdir, LEGACY_CONFIG_NAME),
-            )
-
-            loaded_config = config.__class__.from_pretrained(tempdir)
-            for key in config.__dict__.keys():
-                self.assertEqual(getattr(config, key), getattr(loaded_config, key))
-
-    def random_choice_pretrained_config_field(self) -> Optional[str]:
-        if self.base_model_class is None or not self.base_model_class.constructed_from_pretrained_config():
-            return None
-
-        config = self.base_model_class.config_class()
-        fields = [key for key, value in config.to_dict() if value]
-        return random.choice(fields)
-
-    def test_for_missed_attribute(self):
-        if not self.test_model_compatibility_keys:
-            self.skipTest(f"Do not test model_compatibility_keys on {self.base_model_class}")
-            return
-
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        for model_class in self.all_model_classes:
-            if not model_class.constructed_from_pretrained_config():
-                continue
-
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            all_maps: dict = copy.deepcopy(model_class.config_class.attribute_map)
-
-            for old_attribute, new_attribute in all_maps.items():
-                old_value = getattr(model.config, old_attribute)
-                new_value = getattr(model.config, new_attribute)
-
-                # eg: dropout can be an instance of nn.Dropout, so we should check it attribute
-                if type(new_value) != type(old_value):
-                    continue
-
-                self.assertEqual(old_value, new_value)
-
-    def test_tie_weight(self):
-        # test whether id of input_embeding equal id of output_embeding ?
-        if not self.test_tie_weights:
-            return
-
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        for model_class in self.all_model_classes:
-            if "CausalLM" not in model_class.__name__ and "MaskedLM" not in model_class.__name__:
-                continue
-
-            model = self._make_model_instance(config, model_class)
-            if isinstance(model, BertLMHeadModel):
-                model = model.bert
-            if not model.config.tie_word_embeddings:
-                continue
-
-            if hasattr(model, "get_input_embeddings") and hasattr(model, "get_output_embeddings"):
-                try:
-                    input_embeddings = model.get_input_embeddings()
-                except NotImplementedError:
-                    continue
-
-                try:
-                    output_embeddings = model.get_output_embeddings()
-                except NotImplementedError:
-                    continue
-
-                if input_embeddings is not None and output_embeddings is not None:
-                    if hasattr(output_embeddings, "weight"):
-                        output_embeddings_weight = output_embeddings.weight
-                    else:
-                        output_embeddings_weight = output_embeddings
-
-                    if hasattr(input_embeddings, "weight"):
-                        input_embeddings_weight = input_embeddings.weight
-                    else:
-                        input_embeddings_weight = input_embeddings
-                    print(
-                        input_embeddings_weight,
-                        output_embeddings_weight,
-                    )
-                    print(
-                        "model name :{},id is{},{}".format(
-                            model_class,
-                            id(output_embeddings_weight),
-                            id(input_embeddings_weight),
-                        )
-                    )
-                    self.assertEqual(id(output_embeddings_weight), id(input_embeddings_weight))
-
-
-class ModelTesterPretrainedMixin:
-    base_model_class: PretrainedModel = None
-    hf_remote_test_model_path: str = None
-    paddlehub_remote_test_model_path: str = None
-
-    # Download from HF doesn't work in CI yet
-    @slow
-    def test_model_from_pretrained_hf_hub(self):
-        if self.hf_remote_test_model_path is None or self.base_model_class is None:
-            return
-        model = self.base_model_class.from_pretrained(self.hf_remote_test_model_path, from_hf_hub=True)
-        self.assertIsNotNone(model)
-
-    def test_model_from_pretrained_paddle_hub(self):
-        if self.paddlehub_remote_test_model_path is None or self.base_model_class is None:
-            return
-        model = self.base_model_class.from_pretrained(self.paddlehub_remote_test_model_path)
-        self.assertIsNotNone(model)
-
-    def test_model_from_config_paddle_hub(self):
-        if self.paddlehub_remote_test_model_path is None or self.base_model_class is None:
-            return
-        config = self.base_model_class.config_class.from_pretrained(self.paddlehub_remote_test_model_path)
-        model = self.base_model_class._from_config(config)
-        self.assertIsNotNone(model)
-
-    @slow
-    def test_model_from_pretrained_with_cache_dir(self):
-        for model_name in list(self.base_model_class.pretrained_init_configuration)[:1]:
-            with tempfile.TemporaryDirectory() as tempdir:
-                tempdir = str(tempdir)
-
-                model = self.base_model_class.from_pretrained(model_name, cache_dir=tempdir)
-                self.assertIsNotNone(model)
                 self.assertTrue(
-                    os.path.isfile(
-                        os.path.join(
-                            tempdir,
-                            model_name,
-                            self.base_model_class.resource_files_names["model_state"],
-                        )
-                    )
-                )
-                self.assertTrue(
-                    os.path.isfile(os.path.join(tempdir, model_name, self.base_model_class.model_config_file))
+                    paddle.allclose(
+                        set_nan_tensor_to_zero(tuple_object), set_nan_tensor_to_zero(dict_object), atol=1e-05
+                    ),
+                    msg=f"Tuple and dict output are not equal. Difference: {paddle.max(x=paddle.abs(x=tuple_object - dict_object))}. Tuple has `nan`: {paddle.isnan(x=tuple_object).any()} and `inf`: {paddle.isinf(x=tuple_object)}. Dict has `nan`: {paddle.isnan(x=dict_object).any()} and `inf`: {paddle.isinf(x=dict_object)}.",
                 )
 
-    @slow
-    def test_pretrained_save_and_load(self):
-        """test the pretrained model save and load with two different ways: url-file-name & model_state name
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        model.eval()
+        with paddle.no_grad():
+            outputs_dict = model(**inputs_dict)
+            outputs_tuple = model(**inputs_dict, return_dict=False)
+        recursive_check(outputs_tuple, outputs_dict)
 
-        eg: `bert-base-uncased.pdparams` and `model_state.pdparams`
-        """
-        for model_name in list(self.base_model_class.pretrained_init_configuration)[:1]:
-            model = self.base_model_class.from_pretrained(model_name)
-            self.assertIsNotNone(model)
+    def test_enable_disable_gradient_checkpointing(self):
+        if not self.model_class._supports_gradient_checkpointing:
+            return
+        init_dict, _ = self.prepare_init_args_and_inputs_for_common()
+        model = self.model_class(**init_dict)
+        self.assertFalse(model.is_gradient_checkpointing)
+        model.enable_gradient_checkpointing()
+        self.assertTrue(model.is_gradient_checkpointing)
+        model.disable_gradient_checkpointing()
+        self.assertFalse(model.is_gradient_checkpointing)
 
-            # 1. save and load
-            with tempfile.TemporaryDirectory() as tempdir:
-                tempdirname = str(tempdir)
-                model.save_pretrained(tempdirname)
-
-                loaded_model = self.base_model_class.from_pretrained(tempdirname)
-
-                check_two_model_parameter(model, loaded_model)
-
-            # 2. convert the weight file name
-            with tempfile.TemporaryDirectory() as tempdir:
-                tempdirname = str(tempdir) + "_old"
-
-                shutil.copytree(
-                    os.path.join(MODEL_HOME, model_name),
-                    tempdirname,
-                )
-
-                saved_model_state_file = os.path.join(
-                    tempdirname,
-                    self.base_model_class.resource_files_names["model_state"],
-                )
-
-                self.assertTrue(os.path.isfile(saved_model_state_file))
-
-                # rename it to the old style: name of url, eg: model_state.pdparams -> bert-base-uncased.pdparams
-                url = self.base_model_class.pretrained_resource_files_map["model_state"][model_name]
-                pretrained_resource_file_name = os.path.split(url)[-1]
-                target_file_path = os.path.join(tempdirname, pretrained_resource_file_name)
-
-                shutil.copyfile(saved_model_state_file, target_file_path)
-                os.remove(saved_model_state_file)
-
-                new_model = self.base_model_class.from_pretrained(tempdirname)
-
-                check_two_model_parameter(model, new_model)
+    def test_deprecated_kwargs(self):
+        has_kwarg_in_model_class = "kwargs" in inspect.signature(self.model_class.__init__).parameters
+        has_deprecated_kwarg = len(self.model_class._deprecated_kwargs) > 0
+        if has_kwarg_in_model_class and not has_deprecated_kwarg:
+            raise ValueError(
+                f"{self.model_class} has `**kwargs` in its __init__ method but has not defined any deprecated kwargs under the `_deprecated_kwargs` class attribute. Make sure to either remove `**kwargs` if there are no deprecated arguments or add the deprecated argument with `_deprecated_kwargs = [<deprecated_argument>]`"
+            )
+        if not has_kwarg_in_model_class and has_deprecated_kwarg:
+            raise ValueError(
+                f"{self.model_class} doesn't have `**kwargs` in its __init__ method but has defined deprecated kwargs under the `_deprecated_kwargs` class attribute. Make sure to either add the `**kwargs` argument to {self.model_class}.__init__ if there are deprecated arguments or remove the deprecated argument from `_deprecated_kwargs = [<deprecated_argument>]`"
+            )
